@@ -1,0 +1,207 @@
+---
+title: "DS4420_Final_Project"
+author: "Jack Roberge"
+date: "2025-12-01"
+output: html_document
+---
+
+```{r preprocessing}
+
+library(caret)
+library(dplyr)
+library(fastDummies) 
+
+# read in data
+nfl_data <- read.csv(
+  "nfl_2019.csv", 
+  stringsAsFactors = FALSE, 
+  na.strings = c("NA", "", "NULL", "-")
+)
+
+# keep only plays that are clearly passes or runs
+missing_indices <- which(is.na(nfl_data$pass_length) & is.na(nfl_data$run_location))
+nfl_data <- nfl_data[-missing_indices, ]
+
+# Initialize
+nfl_data$play_call <- NA_character_
+
+# PASS PLAYS:
+# short left pass
+nfl_data$play_call[
+  nfl_data$pass_length == "short" & nfl_data$pass_location == "left"
+] <- "short left pass"
+
+# short right pass
+nfl_data$play_call[
+  nfl_data$pass_length == "short" & nfl_data$pass_location == "right"
+] <- "short right pass"
+
+# deep left pass
+nfl_data$play_call[
+  nfl_data$pass_length == "deep" & nfl_data$pass_location == "left"
+] <- "deep left pass"
+
+# deep right pass
+nfl_data$play_call[
+  nfl_data$pass_length == "deep" & nfl_data$pass_location == "right"
+] <- "deep right pass"
+
+# RUN PLAYS:
+# left run
+nfl_data$play_call[
+  nfl_data$run_location == "left"
+] <- "left run"
+
+# right run
+nfl_data$play_call[
+  nfl_data$run_location == "right"
+] <- "right run"
+
+# Optionally drop plays that don't fit any of the 6 labels
+# (e.g., passes to middle or runs up the middle)
+nfl_data <- nfl_data[!is.na(nfl_data$play_call), ]
+
+# make play_call a factor (useful for classification)
+nfl_data$play_call <- factor(
+  nfl_data$play_call,
+  levels = c(
+    "short left pass",
+    "short right pass",
+    "deep left pass",
+    "deep right pass",
+    "left run",
+    "right run"
+  )
+)
+
+# The new target
+y_target <- nfl_data$play_call
+
+# filter to classification features
+x_features <- c("posteam", "side_of_field", "shotgun", "no_huddle",
+                "yrdln", "down", "goal_to_go", "qtr",
+                "game_seconds_remaining", "posteam_score")
+x_data <- nfl_data[x_features]
+
+x_data$side_of_field <- ifelse(
+  x_data$posteam == x_data$side_of_field,
+  "Theirs",
+  "Opposing"
+)
+
+# one hot encode categorical columns
+categ_cols <- c("posteam", "side_of_field", "yrdln", "down")
+x_data <- dummy_cols(x_data, select_columns = categ_cols, remove_first_dummy = FALSE)
+x_data <- x_data[, !(names(x_data) %in% categ_cols)] 
+
+# normalize continuous features
+continuous_cols <- c("game_seconds_remaining", "posteam_score")
+x_data[, continuous_cols] <- scale(x_data[, continuous_cols])
+
+# add bias term to create final X matrix
+x_data$bias <- 1
+X_all <- as.matrix(x_data)
+storage.mode(X_all) <- "numeric"
+
+# split data into training and test data
+trainIndex <- createDataPartition(y_target, p = .75, list = FALSE, times = 1)
+X_train <- X_all[trainIndex,]
+X_test <- X_all[-trainIndex,]
+```
+
+```{r}
+
+Y_all <- model.matrix(~ play_call - 1, data = nfl_data)
+
+Y_train <- Y_all[trainIndex, ]
+Y_test  <- Y_all[-trainIndex, ]
+
+Y_train <- as.matrix(Y_train)
+storage.mode(Y_train) <- "numeric"
+Y_test <- as.matrix(Y_test)
+storage.mode(Y_test) <- "numeric"
+
+head(Y_train)
+```
+
+```{r mlp setup}
+
+eta <- 0.001 # step size
+q <- 10 # hidden nodes
+
+n <- nrow(X_train)
+d <- ncol(X_train)
+k <- ncol(Y_train)
+
+W1 <- matrix(rnorm(d * q), nrow = d, ncol = q)
+W2 <- matrix(rnorm(q * k), nrow = q, ncol = k)  
+
+# leaky relu (was getting issues with normal relu)
+leaky_relu <- function(x, alpha = 0.01) {
+  ifelse(x > 0, x, alpha * x)
+}
+
+# softmax
+softmax <- function(x) {
+  # x: (n x k)
+  x_shift <- x - apply(x, 1, max)  # numerical stability
+  exp_x <- exp(x_shift)
+  exp_x / rowSums(exp_x)
+}
+
+# forward pass func
+forward_pass <- function(X, W1, W2) {
+  H_net <- X %*% W1              
+  H_out <- leaky_relu(H_net)
+  O_net <- H_out %*% W2          
+  Y_pred <- softmax(O_net)       
+  
+  list(Y_pred = Y_pred, H_out = H_out, H_net = H_net)
+}
+```
+
+```{r mlp}
+errors <- numeric()
+epochs <- 200
+
+# Backprop
+for (epoch in 1:epochs) {
+  fwd <- forward_pass(X_train, W1, W2)
+  
+  delta_2 <- fwd$Y_pred - Y_train
+  dW2 <- t(fwd$H_out) %*% delta_2 / n
+  
+  # Leaky ReLU derivative
+  leaky_relu_deriv <- ifelse(fwd$H_net > 0, 1, 0.01)  
+  delta_1 <- (delta_2 %*% t(W2)) * leaky_relu_deriv
+  dW1 <- t(X_train) %*% delta_1 / n
+  
+  W2 <- W2 - eta * dW2
+  W1 <- W1 - eta * dW1
+  
+  epsilon <- 1e-15
+  L <- -mean(rowSums(Y_train * log(fwd$Y_pred + epsilon)))
+  errors <- c(errors, L)
+}
+
+cat("Initial Loss:", round(errors[1], 4), "\n")
+cat("Final Loss:", round(errors[length(errors)], 4), "\n")
+```
+
+```{r}
+# evaluate
+# Make predictions on test set
+fwd_test <- forward_pass(X_test, W1, W2)
+
+# Predicted classes
+predicted_classes <- apply(fwd_test$Y_pred, 1, which.max)
+true_classes <- apply(Y_test, 1, which.max)
+
+# Calculate accuracy
+accuracy <- mean(predicted_classes == true_classes)
+cat("Test Accuracy:", accuracy)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = predicted_classes, Actual = true_classes)
+print(conf_matrix)
+```
